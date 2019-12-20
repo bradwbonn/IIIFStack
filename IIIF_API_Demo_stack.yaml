@@ -1,0 +1,275 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'Demo of IIIF image manipulation API using API Gateway, S3, and Lambda. IIIF API Specification modeling from https://iiif.io/'
+
+Resources:
+  MyAPI:
+    DependsOn: IIIFLambdaFunction
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: IIIF Rest API Demo
+      BinaryMediaTypes:
+        - 'image/jpeg'
+        - 'image/png'
+        - '*/*'
+      
+  IdentifierResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref MyAPI
+      PathPart: '{identifier}'
+      ParentId: !GetAtt
+        - MyAPI
+        - RootResourceId
+        
+  RegionResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      PathPart: '{region}'
+      ParentId: !Ref IdentifierResource
+      RestApiId: !Ref MyAPI
+
+  SizeResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !Ref RegionResource
+      PathPart: '{size}'
+      RestApiId: !Ref MyAPI
+
+  RotationResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !Ref SizeResource
+      PathPart: '{rotation}'
+      RestApiId: !Ref MyAPI
+
+  QualityFormatResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !Ref RotationResource
+      PathPart: '{quality-format}'
+      RestApiId: !Ref MyAPI
+
+  GetMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      ResourceId: !Ref QualityFormatResource
+      ApiKeyRequired: false
+      AuthorizationType: NONE
+      HttpMethod: GET
+      RestApiId: !Ref MyAPI
+      Integration:
+        Credentials: !GetAtt ApiGatewayIamRole.Arn
+        ConnectionType: INTERNET
+        ContentHandling: CONVERT_TO_TEXT
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Join [ ":", [ "arn:aws:apigateway", !Ref "AWS::Region", "lambda:path/2015-03-31/functions/arn:aws:lambda", !Ref "AWS::Region", !Ref "AWS::AccountId", "function", "IIIFDemoFunctionCF/invocations" ] ]
+      MethodResponses:
+        - ResponseModels:
+            "application/octetstream": "Empty"
+            "image/png": "Empty"
+            "image/jpeg": "Empty"
+          ResponseParameters:
+            "method.response.header.Content-Type": false
+            "method.response.header.content-type": false
+          StatusCode: 200
+        
+  ImageStorageBucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Ref ImageS3BucketName
+
+  IIIFLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    # DependsOn: ImageStorageBucket
+    Properties:
+      Code:
+        ZipFile: |
+          import json, os
+          import cv2
+          import boto3, base64
+          s3 = boto3.resource('s3')
+          def write_to_file(save_path, data):
+              with open(save_path, "wb") as f:
+                  f.write(base64.b64decode(data))
+          def lambda_handler(event, context):
+              # Obtain path-based parameters from API Gateway
+              filename = event['pathParameters']['identifier']
+              region = event['pathParameters']['region']
+              size = event['pathParameters']['size']
+              rotation = event['pathParameters']['rotation']
+              # quality = event['pathParameters']['quality-format'].split('.')[0]
+              # format = event['pathParameters']['quality-format'].split('.')[1]
+              # Read the orginal full-res image from an S3 bucket and put it in Lambda temp storage (max size <512MB)
+              bucketname = os.environ.get('BUCKETNAME')
+              s3.Bucket(bucketname).download_file(filename, '/tmp/image.jpg')
+              # Load image into RAM (max size will vary based on function RAM )
+              image = cv2.imread("/tmp/image.jpg")
+              # Delete full-size image from staging
+              os.remove("/tmp/image.jpg")
+              orig_height, orig_width, orig_channels = image.shape
+              # Execute transformation of image based on path-based parameters
+              # Determine size of image section to return. If full, use entire image in next stage
+              if region == "full":
+                  crop_img = image
+              elif region == "square":
+                  # Return centered square of image - TO DO
+                  pass
+              else:
+                  # Return selected pixels of image based on region field's content
+                  # Currently only supports absolute pixel dimensions:
+                  # region = x,y,w,h
+                  dims = region.split(',')
+                  crop_img = image[int(dims[1]):int(dims[1])+int(dims[3]), int(dims[0]):int(dims[0])+int(dims[2])]
+              # Resize the resulting ROI (region of interest) TO-DO
+              pass
+              # # If grayscale is selected, convert image region to greyscale
+              # gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
+              # Write transformed image to /tmp
+              cv2.imwrite("/tmp/proc.jpg", crop_img)
+              # Convert transformed image to into utf-8 encoded base64
+              with open("/tmp/proc.jpg", "rb") as imageFile:
+                  str = base64.b64encode(imageFile.read())
+                  encoded_img = str.decode("utf-8")
+              # Return the data to API Gateway in base64.
+              # API Gateway will handle the conversion back to binary.
+              # Set content-type header as image/jpeg
+              return {
+                "isBase64Encoded": True,
+                "statusCode": 200,
+                "headers": { "content-type": "image/jpeg"},
+                "body":  encoded_img
+              }
+      Description: Basic python script to implement partial functionality of the IIIF image manipulation API specification
+      Environment:
+        Variables:
+          BUCKETNAME : !Ref ImageS3BucketName
+          PYTHONPATH : /opt/
+      FunctionName: IIIFDemoFunctionCF
+      Handler: index.lambda_handler
+      Layers:
+        - !Ref MyBoto3Layer
+        - !Ref MyImageCV2Layer
+      MemorySize: 1024
+      Role: !GetAtt
+        - LambdaExecutionRole
+        - Arn
+      Runtime: python3.6
+      Timeout: 90
+      
+  ApiGatewayIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ''
+            Effect: 'Allow'
+            Principal:
+              Service:
+                - 'apigateway.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+        - PolicyName: LambdaAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action: 'lambda:*'
+                Resource: !GetAtt IIIFLambdaFunction.Arn
+    
+  ApiGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref ApiGatewayDeployment
+      Description: Lambda IIIF Serverless API Stage v0
+      RestApiId: !Ref MyAPI
+      StageName: 'v0'
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: GetMethod
+    Properties:
+      Description: Lambda IIIF Serverless API Deployment
+      RestApiId: !Ref MyAPI
+        
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt
+        - IIIFLambdaFunction
+        - Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Description: CF-sourced role for IIIF demo lambda function
+      RoleName: IIIFDemoLambdaRole
+
+  LambdaExecutionPolicyS3:
+    DependsOn: ImageStorageBucket
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:Get*'
+              - 's3:List*'
+              - 's3:Head*'
+            Resource: '*'
+      PolicyName: iiiflambdaexecutionpolicys3
+      Roles:
+        - !Ref LambdaExecutionRole
+
+  LambdaExecutionPolicyLogs:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: '*'
+      PolicyName: iiiflambdaexecutionpolicylogs
+      Roles:
+        - !Ref LambdaExecutionRole
+
+Parameters:
+  ImageS3BucketName:
+    Type: String
+    Default: iiifdemooriginals3imagesbucket
+    Description: Must be a globally-unique S3 bucket name for the storage of the original images to be served by the API.
+  MyImageCV2Layer:
+    Type: String
+    Description: Full ARN of the Lambda layer and version for the Image CV2 library
+  MyBoto3Layer:
+    Type: String
+    Description: Full ARN of the Lambda layer and version for generic Python boto3
+
+Outputs:
+  S3BucketName:
+    Description: The S3 bucket for putting original high-res images into
+    Value: !Ref ImageS3BucketName
+  LamdbaFunctionID:
+    Description: The ID of the lambda function created
+    Value: !Ref IIIFLambdaFunction
